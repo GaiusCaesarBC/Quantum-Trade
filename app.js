@@ -78,6 +78,128 @@ const getPlanFromPriceId = (priceId) => {
     return plan;
 };
 
+const getStripeId = (value) => (typeof value === 'string' ? value : value?.id);
+
+const getCustomerFromStripe = async (customerOrId) => {
+    if (!customerOrId) return null;
+    if (typeof customerOrId === 'object') return customerOrId;
+    return stripe.customers.retrieve(customerOrId);
+};
+
+const findUserForStripeSubscription = async (subscription, options = {}) => {
+    const customerId = getStripeId(subscription.customer) || getStripeId(options.customer);
+    const directUserId = options.userId || subscription.metadata?.userId;
+    let customer = options.customer || null;
+    let user = null;
+
+    if (subscription.id) {
+        user = await User.findOne({ 'subscription.stripeSubscriptionId': subscription.id });
+    }
+
+    if (!user && customerId) {
+        user = await User.findOne({ 'subscription.stripeCustomerId': customerId });
+    }
+
+    if (!user && directUserId && mongoose.Types.ObjectId.isValid(directUserId)) {
+        user = await User.findById(directUserId);
+    }
+
+    if (!user && customerId) {
+        try {
+            customer = await getCustomerFromStripe(customer || customerId);
+            const metadataUserId = customer.metadata?.userId;
+
+            if (metadataUserId && mongoose.Types.ObjectId.isValid(metadataUserId)) {
+                user = await User.findById(metadataUserId);
+            }
+
+            if (!user && customer.email) {
+                const escapedEmail = customer.email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                user = await User.findOne({ email: new RegExp(`^${escapedEmail}$`, 'i') });
+            }
+        } catch (stripeErr) {
+            console.error(`[Stripe Webhook] Error retrieving customer ${customerId}: ${stripeErr.message}`);
+        }
+    }
+
+    return { user, customer, customerId };
+};
+
+const syncStripeSubscriptionToMongo = async (subscription, options = {}) => {
+    if (!subscription?.id) {
+        throw new Error('Cannot sync Stripe subscription without an id');
+    }
+
+    const activeStatuses = new Set(['active', 'trialing']);
+    if (!activeStatuses.has(subscription.status)) {
+        console.log(`[Stripe Webhook] Subscription ${subscription.id} is ${subscription.status}; not granting paid access yet.`);
+        return null;
+    }
+
+    const priceId = subscription.items?.data?.[0]?.price?.id;
+    if (!priceId) {
+        throw new Error(`Subscription ${subscription.id} has no price ID`);
+    }
+
+    const plan = getPlanFromPriceId(priceId);
+    const { user, customerId } = await findUserForStripeSubscription(subscription, options);
+
+    if (!user) {
+        throw new Error(`No Mongo user found for Stripe subscription ${subscription.id} / customer ${getStripeId(subscription.customer)}`);
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(
+        user._id,
+        {
+            $set: {
+                'subscription.status': plan,
+                'subscription.stripeCustomerId': customerId || getStripeId(subscription.customer),
+                'subscription.stripeSubscriptionId': subscription.id,
+                'subscription.stripePriceId': priceId,
+                'subscription.currentPeriodStart': new Date(subscription.current_period_start * 1000),
+                'subscription.currentPeriodEnd': new Date(subscription.current_period_end * 1000),
+                'subscription.cancelAtPeriodEnd': subscription.cancel_at_period_end
+            }
+        },
+        { new: true }
+    );
+
+    console.log(`[Stripe Webhook] Synced subscription ${subscription.id} to user ${updatedUser._id}: ${plan}`);
+
+    try {
+        const { syncPremiumRole } = require('./services/discordService');
+        await syncPremiumRole(updatedUser._id);
+    } catch (discordErr) {
+        console.error('[Stripe Webhook] Discord role sync error:', discordErr.message);
+    }
+
+    return updatedUser;
+};
+
+const clearStripeSubscriptionInMongo = async (subscription) => {
+    const { user } = await findUserForStripeSubscription(subscription);
+
+    if (!user) {
+        throw new Error(`No Mongo user found for canceled Stripe subscription ${subscription.id}`);
+    }
+
+    user.subscription.status = 'free';
+    user.subscription.stripeSubscriptionId = null;
+    user.subscription.currentPeriodEnd = null;
+    await user.save();
+
+    console.log(`[Stripe Webhook] Canceled subscription ${subscription.id} for user ${user._id}`);
+
+    try {
+        const { syncPremiumRole } = require('./services/discordService');
+        await syncPremiumRole(user._id);
+    } catch (discordErr) {
+        console.error('[Stripe Webhook] Discord role removal error:', discordErr.message);
+    }
+
+    return user;
+};
+
 // Rate limiter for Stripe webhook (lenient - Stripe retries on failure)
 const webhookLimiter = rateLimit({
     windowMs: 60 * 1000, // 1 minute
@@ -115,139 +237,54 @@ app.post('/api/stripe/webhook',
             switch (event.type) {
                 case 'checkout.session.completed': {
                     const session = event.data.object;
-                    const userId = session.metadata.userId;
                     const subscriptionId = session.subscription;
 
-                    console.log(`[Stripe Webhook] checkout.session.completed for user ${userId}`);
+                    console.log(`[Stripe Webhook] checkout.session.completed for user ${session.metadata?.userId}`);
                     console.log(`[Stripe Webhook] Subscription ID: ${subscriptionId}`);
 
-                    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-                    const priceId = subscription.items.data[0].price.id;
-                    const plan = getPlanFromPriceId(priceId);
-
-                    console.log(`[Stripe Webhook] Updating user ${userId} to plan: ${plan}`);
-
-                    const updatedUser = await User.findByIdAndUpdate(userId, {
-                        'subscription.status': plan,
-                        'subscription.stripeSubscriptionId': subscriptionId,
-                        'subscription.stripeCustomerId': session.customer,
-                        'subscription.stripePriceId': priceId,
-                        'subscription.currentPeriodStart': new Date(subscription.current_period_start * 1000),
-                        'subscription.currentPeriodEnd': new Date(subscription.current_period_end * 1000),
-                        'subscription.cancelAtPeriodEnd': false
-                    }, { new: true });
-
-                    console.log(`✅ Subscription created for user ${userId}: ${plan}`);
-                    console.log(`[Stripe Webhook] Updated user subscription:`, updatedUser?.subscription);
-
-                    // Sync Discord premium role
-                    try {
-                        const { syncPremiumRole } = require('./services/discordService');
-                        await syncPremiumRole(userId);
-                    } catch (discordErr) {
-                        console.error('[Stripe Webhook] Discord role sync error:', discordErr.message);
+                    if (!subscriptionId) {
+                        console.log('[Stripe Webhook] Checkout session has no subscription; skipping subscription sync.');
+                        break;
                     }
+
+                    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+                    await syncStripeSubscriptionToMongo(subscription, {
+                        userId: session.metadata?.userId || session.client_reference_id,
+                        customer: session.customer
+                    });
                     break;
                 }
 
+                case 'customer.subscription.created':
                 case 'customer.subscription.updated': {
                     const subscription = event.data.object;
-                    const customerId = subscription.customer;
-                    const subscriptionId = subscription.id;
-
-                    console.log(`[Stripe Webhook] customer.subscription.updated for customer ${customerId}, subscription ${subscriptionId}`);
-
-                    // Try to find user by stripeCustomerId
-                    let user = await User.findOne({ 'subscription.stripeCustomerId': customerId });
-
-                    // If not found, try to get userId from Stripe customer metadata
-                    if (!user) {
-                        try {
-                            console.log(`[Stripe Webhook] User not found by stripeCustomerId, checking Stripe customer metadata...`);
-                            const customer = await stripe.customers.retrieve(customerId);
-                            const userId = customer.metadata?.userId;
-
-                            if (userId) {
-                                console.log(`[Stripe Webhook] Found userId in customer metadata: ${userId}`);
-                                user = await User.findById(userId);
-                                
-                                if (user) {
-                                    // Update the stripeCustomerId field to prevent this issue next time
-                                    if (!user.subscription) {
-                                        user.subscription = {};
-                                    }
-                                    user.subscription.stripeCustomerId = customerId;
-                                    console.log(`[Stripe Webhook] ✅ Found user by metadata, updated stripeCustomerId`);
-                                }
-                            }
-                        } catch (stripeErr) {
-                            console.error(`[Stripe Webhook] Error retrieving customer metadata: ${stripeErr.message}`);
-                        }
-                    }
-
-                    if (user) {
-                        const priceId = subscription.items.data[0].price.id;
-                        const plan = getPlanFromPriceId(priceId);
-
-                        user.subscription.status = plan;
-                        user.subscription.stripeSubscriptionId = subscriptionId;
-                        user.subscription.stripePriceId = priceId;
-                        user.subscription.currentPeriodStart = new Date(subscription.current_period_start * 1000);
-                        user.subscription.currentPeriodEnd = new Date(subscription.current_period_end * 1000);
-                        user.subscription.cancelAtPeriodEnd = subscription.cancel_at_period_end;
-                        await user.save();
-
-                        console.log(`✅ Subscription updated for user ${user._id}: ${plan}`);
-                    } else {
-                        console.error(`[Stripe Webhook] ⚠️ ERROR: No user found for customer ${customerId}. Subscription update FAILED!`);
-                        console.error(`[Stripe Webhook] This user needs manual intervention to update their subscription to the new plan.`);
-                    }
+                    console.log(`[Stripe Webhook] ${event.type} for customer ${getStripeId(subscription.customer)}, subscription ${subscription.id}`);
+                    await syncStripeSubscriptionToMongo(subscription);
                     break;
                 }
 
                 case 'customer.subscription.deleted': {
                     const subscription = event.data.object;
-                    const customerId = subscription.customer;
+                    console.log(`[Stripe Webhook] customer.subscription.deleted for customer ${getStripeId(subscription.customer)}`);
+                    await clearStripeSubscriptionInMongo(subscription);
+                    break;
+                }
 
-                    console.log(`[Stripe Webhook] customer.subscription.deleted for customer ${customerId}`);
+                case 'invoice.payment_succeeded': {
+                    const invoice = event.data.object;
+                    const subscriptionId = getStripeId(invoice.subscription);
 
-                    // Try to find user by stripeCustomerId
-                    let user = await User.findOne({ 'subscription.stripeCustomerId': customerId });
+                    console.log(`[Stripe Webhook] invoice.payment_succeeded for customer ${getStripeId(invoice.customer)}, subscription ${subscriptionId}`);
 
-                    // If not found, try to get userId from Stripe customer metadata
-                    if (!user) {
-                        try {
-                            console.log(`[Stripe Webhook] User not found by stripeCustomerId, checking Stripe customer metadata...`);
-                            const customer = await stripe.customers.retrieve(customerId);
-                            const userId = customer.metadata?.userId;
-
-                            if (userId) {
-                                console.log(`[Stripe Webhook] Found userId in customer metadata: ${userId}`);
-                                user = await User.findById(userId);
-                            }
-                        } catch (stripeErr) {
-                            console.error(`[Stripe Webhook] Error retrieving customer metadata: ${stripeErr.message}`);
-                        }
+                    if (!subscriptionId) {
+                        console.log('[Stripe Webhook] Paid invoice has no subscription; skipping subscription sync.');
+                        break;
                     }
 
-                    if (user) {
-                        user.subscription.status = 'free';
-                        user.subscription.stripeSubscriptionId = null;
-                        user.subscription.currentPeriodEnd = null;
-                        await user.save();
-
-                        console.log(`✅ Subscription canceled for user ${user._id}`);
-
-                        // Remove Discord premium role
-                        try {
-                            const { syncPremiumRole } = require('./services/discordService');
-                            await syncPremiumRole(user._id);
-                        } catch (discordErr) {
-                            console.error('[Stripe Webhook] Discord role removal error:', discordErr.message);
-                        }
-                    } else {
-                        console.error(`[Stripe Webhook] ⚠️ ERROR: No user found for customer ${customerId}. Subscription cancellation NOT recorded!`);
-                    }
+                    const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+                    await syncStripeSubscriptionToMongo(subscription, {
+                        customer: invoice.customer
+                    });
                     break;
                 }
 
@@ -264,7 +301,7 @@ app.post('/api/stripe/webhook',
             }
         } catch (handlerError) {
             console.error(`[Stripe Webhook] Error handling event:`, handlerError);
-            // Still return 200 so Stripe doesn't retry
+            return res.status(500).json({ error: 'Webhook handler failed' });
         }
 
         res.json({ received: true });

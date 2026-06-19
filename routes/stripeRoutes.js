@@ -121,8 +121,14 @@ router.post('/create-checkout-session', auth, async (req, res) => {
             mode: 'subscription',
             success_url: `${process.env.CLIENT_URL || 'http://localhost:3000'}/dashboard?success=true&session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${process.env.CLIENT_URL || 'http://localhost:3000'}/pricing?canceled=true`,
+            client_reference_id: user._id.toString(),
             metadata: {
                 userId: user._id.toString()
+            },
+            subscription_data: {
+                metadata: {
+                    userId: user._id.toString()
+                }
             }
         };
 
