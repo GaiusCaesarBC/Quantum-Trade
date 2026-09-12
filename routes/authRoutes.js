@@ -106,7 +106,7 @@ router.post(
             await user.save();
             console.log(`[Auth Route /register] New user created: ${user.email} (Username: ${user.username})`);
 
-            const payload = { user: { id: user.id } };
+            const payload = { user: { id: user.id }, purpose: 'access' };
            jwt.sign(
     payload,
     process.env.JWT_SECRET,
@@ -353,7 +353,7 @@ router.post(
                 console.error('[Auth Route /login] Streak check error:', streakError.message);
             }
 
-            const payload = { user: { id: user.id } };
+            const payload = { user: { id: user.id }, purpose: 'access' };
             jwt.sign(
                 payload,
                 process.env.JWT_SECRET,

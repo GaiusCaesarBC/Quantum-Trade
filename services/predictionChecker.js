@@ -240,6 +240,7 @@ async function checkExpiredPredictions() {
 
         // Find all pending predictions that have expired
         const expiredPredictions = await Prediction.find({
+            user: { $ne: null },
             status: 'pending',
             expiresAt: { $lte: new Date() }
         }).limit(50);
@@ -436,7 +437,7 @@ async function markStaleAsExpired() {
         thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
         const result = await Prediction.updateMany(
-            { status: 'pending', expiresAt: { $lte: thirtyDaysAgo } },
+            { user: { $ne: null }, status: 'pending', expiresAt: { $lte: thirtyDaysAgo } },
             { $set: { status: 'expired' } }
         );
 

@@ -128,12 +128,13 @@ router.get('/leaderboard', async (req, res) => {
  */
 router.post('/buy', authMiddleware, async (req, res) => {
     try {
-        const { quantity, price, assetType = 'stock' } = req.body;
+        const { quantity, assetType = 'stock' } = req.body;
+        let price;
 
-        if (!req.body.symbol || !quantity || !price) {
+        if (!req.body.symbol || !quantity) {
             return res.status(400).json({
                 success: false,
-                error: 'Symbol, quantity, and price are required'
+                error: 'Symbol and quantity are required'
             });
         }
 
@@ -149,7 +150,12 @@ router.post('/buy', authMiddleware, async (req, res) => {
             });
         }
 
-        if (quantity <= 0 || price <= 0) {
+        const quote = await require('../services/priceService').getCurrentPrice(symbol, assetType);
+        price = Number(quote?.price);
+        if (!Number.isFinite(price) || price <= 0) {
+            return res.status(503).json({ error: 'A valid market quote is required to execute this trade' });
+        }
+        if (!Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
             return res.status(400).json({
                 success: false,
                 error: 'Quantity and price must be positive numbers'

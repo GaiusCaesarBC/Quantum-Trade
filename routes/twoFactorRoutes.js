@@ -1,3 +1,4 @@
+const { verifyChallengeToken } = require('../utils/authTokens');
 // server/routes/twoFactorRoutes.js - Two-Factor Authentication Routes
 
 const express = require('express');
@@ -470,12 +471,12 @@ router.post('/send-login-code', async (req, res) => {
         // Verify temp token
         let decoded;
         try {
-            decoded = jwt.verify(tempToken, process.env.JWT_SECRET);
+            decoded = verifyChallengeToken(tempToken);
         } catch (err) {
             return res.status(401).json({ success: false, error: 'Invalid or expired token' });
         }
 
-        if (!decoded.requires2FA) {
+        if (decoded.purpose !== '2fa_verification') {
             return res.status(400).json({ success: false, error: 'Invalid token type' });
         }
 
@@ -567,12 +568,12 @@ router.post('/verify-login', async (req, res) => {
         // Verify temp token
         let decoded;
         try {
-            decoded = jwt.verify(tempToken, process.env.JWT_SECRET);
+            decoded = verifyChallengeToken(tempToken);
         } catch (err) {
             return res.status(401).json({ success: false, error: 'Invalid or expired token' });
         }
 
-        if (!decoded.requires2FA) {
+        if (decoded.purpose !== '2fa_verification') {
             return res.status(400).json({ success: false, error: 'Invalid token type' });
         }
 
@@ -683,7 +684,7 @@ router.post('/verify-login', async (req, res) => {
         await user.save();
 
         // Generate full JWT
-        const payload = { user: { id: user.id } };
+        const payload = { user: { id: user.id }, purpose: 'access' };
         const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1h' });
 
         // Set cookie

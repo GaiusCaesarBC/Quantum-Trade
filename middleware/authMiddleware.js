@@ -1,16 +1,9 @@
 // server/middleware/authMiddleware.js
-const jwt = require('jsonwebtoken');
+const { verifyAccessToken, requestToken } = require('../utils/authTokens');
 const User = require('../models/User');
 
 module.exports = async (req, res, next) => {
-    // ✅ FIXED: Check cookies, x-auth-token, AND Authorization Bearer header
-    let token = req.cookies.token || req.header('x-auth-token');
-    
-    // Check Authorization header (Bearer token)
-    const authHeader = req.header('Authorization');
-    if (!token && authHeader && authHeader.startsWith('Bearer ')) {
-        token = authHeader.replace('Bearer ', '');
-    }
+    const token = requestToken(req);
 
     if (!token) {
         console.log("[AuthMiddleware] No token found in cookies or headers.");
@@ -25,7 +18,7 @@ module.exports = async (req, res, next) => {
         }
 
         // 2. Verify token
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const decoded = verifyAccessToken(token);
         // Note: Removed token logging for security
 
         // 3. Attach user to request

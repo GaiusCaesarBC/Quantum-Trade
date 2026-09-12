@@ -288,7 +288,7 @@ PredictionSchema.methods.isExpired = function() {
 
 // Method to calculate outcome
 PredictionSchema.methods.calculateOutcome = async function(currentPrice) {
-    if (this.status !== 'pending') {
+    if (this.status !== 'pending' || !this.user) {
         return; // Already checked
     }
 

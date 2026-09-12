@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "server": "nodemon app.js",
-    "seed-vault": "node scripts/seedVault.js"
+    "seed-vault": "node scripts/seedVault.js",
+    "test": "node --test tests/security.test.js tests/signals.test.js tests/login-routes.test.js tests/rate-limits.test.js"
   },
   "keywords": [],
   "author": "",

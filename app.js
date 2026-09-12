@@ -1,3 +1,5 @@
+const auth = require('./middleware/authMiddleware');
+const requireAdmin = require('./middleware/adminMiddleware');
 // server/app.js - Updated with Portfolio, Predictions, Chat, Alerts, and PATTERN Routes
 
 require('dotenv').config();
@@ -22,6 +24,14 @@ const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const app = express();
+// These routes are registered before the general API middleware.
+const adminLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    message: { error: 'Too many administrative requests, please slow down' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 const journalRoutes = require('./routes/journalRoutes');
 const screenerRoutes = require('./routes/screenerRoutes');
 const opportunitiesRoutes = require('./routes/opportunitiesRoutes');
@@ -442,59 +452,9 @@ const connectDB = async () => {
         const { startSignalGenerator } = require('./services/signalGenerator');
         startSignalGenerator();
 
-        // ✅ AUTO-BACKFILL + SIGNAL RESULT CHECKER
-        // First backfill locked levels, then start checking for TP/SL hits
-        const { startSignalResultChecker, runCheckCycle } = require('./services/signalResultChecker');
-
-        (async () => {
-            try {
-                const Prediction = require('./models/Prediction');
-                const signals = await Prediction.find({
-                    $or: [
-                        { entryPrice: { $exists: false } },
-                        { entryPrice: null }
-                    ]
-                });
-
-                if (signals.length > 0) {
-                    console.log(`[Backfill] Found ${signals.length} signals without locked levels, fixing...`);
-
-                    for (const signal of signals) {
-                        const entry = signal.currentPrice;
-                        const target = signal.targetPrice;
-
-                        if (!entry || !target || entry <= 0) continue;
-
-                        const range = Math.abs(target - entry);
-                        const isLong = signal.direction === 'UP';
-
-                        signal.entryPrice = entry;
-                        signal.stopLoss = isLong ? entry - range * 0.25 : entry + range * 0.25;
-                        signal.takeProfit1 = isLong ? entry + range * 0.5 : entry - range * 0.5;
-                        signal.takeProfit2 = target;
-                        signal.takeProfit3 = isLong ? entry + range * 1.75 : entry - range * 1.75;
-                        signal.livePrice = entry;
-                        signal.livePriceUpdatedAt = signal.createdAt;
-
-                        await signal.save();
-                    }
-
-                    console.log(`[Backfill] ✅ Fixed ${signals.length} signals with locked levels`);
-                }
-
-                // Start the scheduled checker
-                startSignalResultChecker();
-
-                // Run immediately after backfill to catch any TP/SL hits
-                console.log('[SignalChecker] Running initial check after backfill...');
-                await runCheckCycle();
-
-            } catch (err) {
-                console.error('[Backfill] Error:', err.message);
-                // Start checker anyway even if backfill fails
-                startSignalResultChecker();
-            }
-        })();
+        // Historical records are immutable; migrations run separately after review.
+        const { startSignalResultChecker } = require('./services/signalResultChecker');
+        startSignalResultChecker();
 
         // TELEGRAM BOT — Conversion funnel (teases signals, posts results, drives to website)
         try {
@@ -509,7 +469,7 @@ const connectDB = async () => {
         startXPoster();
 
         // X test endpoint (temporary — remove after testing)
-        app.get('/api/test-x-post', async (req, res) => {
+        app.post('/api/test-x-post', adminLimiter, auth, requireAdmin, async (req, res) => {
             try {
                 const result = await testXPost();
                 res.json({ success: !!result, result: result || 'failed — check Render logs' });
@@ -519,7 +479,7 @@ const connectDB = async () => {
         });
 
         // Signal checker diagnostic endpoint
-        app.get('/api/admin/checker-status', async (req, res) => {
+        app.get('/api/admin/checker-status', adminLimiter, auth, requireAdmin, async (req, res) => {
             try {
                 const { getCheckerStats, runCheckCycle } = require('./services/signalResultChecker');
                 const Prediction = require('./models/Prediction');
@@ -562,7 +522,7 @@ const connectDB = async () => {
         });
 
         // Manually trigger checker cycle
-        app.get('/api/admin/run-checker', async (req, res) => {
+        app.post('/api/admin/run-checker', adminLimiter, auth, requireAdmin, async (req, res) => {
             try {
                 const { runCheckCycle, getCheckerStats } = require('./services/signalResultChecker');
                 console.log('[Admin] Manually triggering signal checker...');
@@ -575,73 +535,17 @@ const connectDB = async () => {
         });
 
         // Admin: expire stale predictions that are still "pending" past their expiresAt or older than 14 days
-        app.get('/api/admin/expire-stale', async (req, res) => {
-            try {
-                const Prediction = require('./models/Prediction');
-                const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
-
-                // Expire predictions past their expiresAt
-                const r1 = await Prediction.updateMany(
-                    { status: 'pending', expiresAt: { $exists: true, $lt: new Date() } },
-                    { $set: { status: 'expired', resultText: 'Expired', resultAt: new Date() } }
-                );
-
-                // Expire predictions older than 14 days with no expiresAt
-                const r2 = await Prediction.updateMany(
-                    { status: 'pending', expiresAt: { $exists: false }, createdAt: { $lt: fourteenDaysAgo } },
-                    { $set: { status: 'expired', resultText: 'Expired', resultAt: new Date() } }
-                );
-
-                // Expire predictions older than 14 days where expiresAt is null
-                const r3 = await Prediction.updateMany(
-                    { status: 'pending', expiresAt: null, createdAt: { $lt: fourteenDaysAgo } },
-                    { $set: { status: 'expired', resultText: 'Expired', resultAt: new Date() } }
-                );
-
-                const total = r1.modifiedCount + r2.modifiedCount + r3.modifiedCount;
-                res.json({ success: true, expired: total, details: { pastExpiry: r1.modifiedCount, noExpiry: r2.modifiedCount, nullExpiry: r3.modifiedCount } });
-            } catch (e) {
-                res.json({ success: false, error: e.message });
-            }
-        });
+        app.get('/api/admin/expire-stale', adminLimiter, auth, requireAdmin, async (req, res) => {
+    return res.status(410).json({ error: 'Historical cleanup is disabled. Use a reviewed offline migration.' });
+});
 
         // Admin: clean up bad signals (broken SL/TP levels or blown-past SL)
-        app.get('/api/admin/cleanup-bad-signals', async (req, res) => {
-            try {
-                const Prediction = require('./models/Prediction');
-                const badSignals = await Prediction.find({
-                    user: null,
-                    entryPrice: { $exists: true, $gt: 0 },
-                    stopLoss: { $exists: true, $gt: 0 },
-                });
-                let removed = 0;
-                for (const s of badSignals) {
-                    const slDist = Math.abs(s.stopLoss - s.entryPrice) / s.entryPrice * 100;
-                    // Remove if SL too close to entry
-                    if (slDist < 1.0) {
-                        await Prediction.deleteOne({ _id: s._id });
-                        removed++;
-                        console.log(`[Cleanup] Removed ${s.symbol} (SL ${slDist.toFixed(2)}% from entry)`);
-                        continue;
-                    }
-                    // Remove if loss result blew way past SL (result > 3x SL distance = broken)
-                    if (s.result === 'loss' && s.resultPrice && s.entryPrice) {
-                        const actualLoss = Math.abs(s.resultPrice - s.entryPrice) / s.entryPrice * 100;
-                        if (actualLoss > slDist * 3 && actualLoss > 10) {
-                            await Prediction.deleteOne({ _id: s._id });
-                            removed++;
-                            console.log(`[Cleanup] Removed ${s.symbol} (actual loss ${actualLoss.toFixed(1)}% >> SL ${slDist.toFixed(1)}%)`);
-                        }
-                    }
-                }
-                res.json({ success: true, removed, message: `Removed ${removed} signals with broken levels` });
-            } catch (e) {
-                res.json({ success: false, error: e.message });
-            }
-        });
+        app.get('/api/admin/cleanup-bad-signals', adminLimiter, auth, requireAdmin, async (req, res) => {
+    return res.status(410).json({ error: 'Historical cleanup is disabled. Use a reviewed offline migration.' });
+});
 
         // Admin: Check subscription status for a user (by email or userId)
-        app.get('/api/admin/subscription-status', async (req, res) => {
+        app.get('/api/admin/subscription-status', adminLimiter, auth, requireAdmin, async (req, res) => {
             try {
                 const { email, userId } = req.query;
                 if (!email && !userId) {
@@ -706,11 +610,11 @@ const connectDB = async () => {
 
         // Admin: Manually sync subscription from Stripe (fix missed webhooks)
         // Supports both GET (browser-friendly) and POST
-        app.get('/api/admin/sync-subscription', async (req, res) => {
+        app.get('/api/admin/sync-subscription', adminLimiter, auth, requireAdmin, async (req, res) => {
             const { email, userId } = req.query;
             return handleSyncSubscription(email, userId, res);
         });
-        app.post('/api/admin/sync-subscription', async (req, res) => {
+        app.post('/api/admin/sync-subscription', adminLimiter, auth, requireAdmin, async (req, res) => {
             const { email, userId } = req.body;
             return handleSyncSubscription(email, userId, res);
         });
@@ -811,7 +715,7 @@ const connectDB = async () => {
         }
 
         // Manual signal generation trigger (for debugging)
-        app.get('/api/trigger-signals', async (req, res) => {
+        app.post('/api/trigger-signals', adminLimiter, auth, requireAdmin, async (req, res) => {
             try {
                 const { runCycle } = require('./services/signalGenerator');
                 res.json({ success: true, message: 'Signal cycle triggered — check logs' });
@@ -936,6 +840,8 @@ app.use(requestLogger);
 // Apply rate limiting
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
+app.use('/api/users/login', authLimiter);
+app.use('/api/users/register', authLimiter);
 app.use('/api/', apiLimiter);
 
 // --- ROUTE IMPORTS ---

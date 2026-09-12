@@ -120,51 +120,11 @@ async function getLivePrice(symbol, assetType) {
 function checkResult(signal, livePrice) {
     const { direction, entryPrice, stopLoss, takeProfit1, takeProfit2, takeProfit3 } = signal;
 
-    if (!entryPrice || !stopLoss || !livePrice) return null;
-
-    // ─── PRICE SANITY GATE ────────────────────────────────────
-    // Reject live prices that are unreasonably far from entry.
-    // If the price is >40% away, the data source is almost certainly
-    // returning the wrong token, a stale cache, or API garbage.
-    // This prevents recording fake wins/losses from bad price data
-    // (the exact problem cleanupBadPriceResults.js was fixing
-    // retroactively — now caught inline before saving).
-    const priceDeltaPct = Math.abs((livePrice - entryPrice) / entryPrice) * 100;
-    if (priceDeltaPct > 40) {
-        console.warn(`[SignalChecker] ⚠️ ${signal.symbol}: Live price $${livePrice} is ${priceDeltaPct.toFixed(1)}% from entry $${entryPrice} — rejecting as bad data`);
-        return null;
-    }
-
-    // Reject obviously invalid prices (zero, negative)
-    if (livePrice <= 0) {
-        console.log(`[SignalChecker] ⚠ ${signal.symbol}: Invalid price ${livePrice}, skipping`);
-        return null;
-    }
-
+    if (![entryPrice, stopLoss, livePrice].every(p => Number.isFinite(p) && p > 0)) return null;
+    if (!['UP', 'DOWN'].includes(direction)) return null;
     const isLong = direction === 'UP';
-
-    // ─── SL HIT DISTANCE VALIDATION ──────────────────────────
-    // After confirming SL was hit, verify the loss % is reasonable.
-    // Our SL structure is 5% from entry. If the result shows a loss
-    // of >15%, the SL value itself was likely broken (from the old
-    // bug where SL was calculated from ML target instead of fixed %).
-    // In that case, skip recording the result — the signal's SL is
-    // corrupt and shouldn't count.
-    const slDistPct = Math.abs((livePrice - entryPrice) / entryPrice) * 100;
-
-    // Check Stop Loss hit
-    if (isLong && livePrice <= stopLoss) {
-        if (slDistPct > 15) {
-            console.warn(`[SignalChecker] ⚠️ ${signal.symbol}: SL hit but loss is ${slDistPct.toFixed(1)}% (max expected ~5%) — skipping corrupt SL`);
-            return null;
-        }
-        return { result: 'loss', resultText: 'SL Hit', resultPrice: livePrice };
-    }
-    if (!isLong && livePrice >= stopLoss) {
-        if (slDistPct > 15) {
-            console.warn(`[SignalChecker] ⚠️ ${signal.symbol}: SL hit but loss is ${slDistPct.toFixed(1)}% (max expected ~5%) — skipping corrupt SL`);
-            return null;
-        }
+    // A gap through a stop is still a loss. Distance alone is not bad-data evidence.
+    if ((isLong && livePrice <= stopLoss) || (!isLong && livePrice >= stopLoss)) {
         return { result: 'loss', resultText: 'SL Hit', resultPrice: livePrice };
     }
 
@@ -194,14 +154,6 @@ function checkResult(signal, livePrice) {
 // ─── Main Check Cycle ─────────────────────────────────────
 
 async function runCheckCycle() {
-    // Safety: if the previous cycle's isRunning flag has been stuck for
-    // longer than MAX_CYCLE_MS, force-reset it. This prevents a single
-    // crashed cycle from permanently blocking all future checks.
-    if (isRunning && runStartedAt && (Date.now() - runStartedAt > MAX_CYCLE_MS)) {
-        console.warn(`[SignalChecker] ⚠️ Previous cycle stuck for ${((Date.now() - runStartedAt) / 1000).toFixed(0)}s — force-resetting isRunning flag`);
-        isRunning = false;
-    }
-
     if (isRunning) {
         console.log('[SignalChecker] Already running, skipping...');
         return;
@@ -217,16 +169,17 @@ async function runCheckCycle() {
         console.log('[SignalChecker] Checking active signals for TP/SL hits...');
 
         // Get all pending signals that have locked levels
-        const signals = await Prediction.find({
+        const signals = Prediction.find({
+            user: null,
             status: 'pending',
             result: null,
             entryPrice: { $exists: true, $ne: null },
             expiresAt: { $gt: new Date() }
-        }).limit(100);
+        }).sort({ _id: 1 }).cursor({ batchSize: 100 });
 
-        console.log(`[SignalChecker] Found ${signals.length} active signals to check`);
+        console.log('[SignalChecker] Streaming all active system signals');
 
-        for (const signal of signals) {
+        for await (const signal of signals) {
             try {
                 const livePrice = await getLivePrice(signal.symbol, signal.assetType);
 
@@ -235,19 +188,19 @@ async function runCheckCycle() {
                     continue;
                 }
 
-                // Update live price
-                signal.livePrice = livePrice;
-                signal.livePriceUpdatedAt = new Date();
-
-                // Check for result
                 const outcome = checkResult(signal, livePrice);
-
+                const update = { livePrice, livePriceUpdatedAt: new Date() };
+                if (outcome) Object.assign(update, outcome, {
+                    resultAt: new Date(), status: outcome.result === 'win' ? 'correct' : 'incorrect'
+                });
+                // Only one worker can transition a pending record and notify its result.
+                const updated = await Prediction.findOneAndUpdate(
+                    { _id: signal._id, user: null, status: 'pending', result: null },
+                    { $set: update }, { new: true }
+                );
+                if (!updated) continue;
                 if (outcome) {
-                    signal.result = outcome.result;
-                    signal.resultText = outcome.resultText;
-                    signal.resultPrice = outcome.resultPrice;
-                    signal.resultAt = new Date();
-                    signal.status = outcome.result === 'win' ? 'correct' : 'incorrect';
+                    Object.assign(signal, update);
 
                     // Calculate movement percentage from entry (inverted for shorts: drop = positive profit)
                     const isLong = signal.direction === 'UP';
@@ -274,7 +227,6 @@ async function runCheckCycle() {
                     else losses++;
                 }
 
-                await signal.save();
                 checked++;
 
                 // Rate limit: 500ms between checks
@@ -286,21 +238,12 @@ async function runCheckCycle() {
             }
         }
 
-        // Check for expired signals without result
-        const expiredSignals = await Prediction.find({
-            status: 'pending',
-            result: null,
-            expiresAt: { $lt: new Date() }
-        });
-
-        for (const signal of expiredSignals) {
-            signal.result = null;
-            signal.resultText = 'Expired';
-            signal.status = 'expired';
-            signal.resultAt = new Date();
-            await signal.save();
-            console.log(`[SignalChecker] ⏰ ${signal.symbol}: Expired without hitting TP or SL`);
-        }
+        // Do not invent a win/loss at expiry. Snapshot polling cannot establish
+        // whether an unobserved intrabar threshold was crossed.
+        await Prediction.updateMany({ user: null, status: 'pending', result: null,
+            expiresAt: { $lte: new Date() } }, { $set: {
+                resultText: 'Expired — no observed outcome', status: 'expired', resultAt: new Date()
+            } });
 
     } catch (err) {
         console.error('[SignalChecker] Cycle error:', err.message);
@@ -340,5 +283,6 @@ function getCheckerStats() {
 module.exports = {
     startSignalResultChecker,
     runCheckCycle,
-    getCheckerStats
+    getCheckerStats,
+    checkResult
 };

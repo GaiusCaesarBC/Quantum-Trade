@@ -20,8 +20,8 @@ const CRYPTO_ID_MAP = {
 
 class BacktestEngine {
     constructor(options = {}) {
-        this.commissionRate = options.commissionRate || 0.001; // 0.1% per trade
-        this.slippage = options.slippage || 0.0005; // 0.05% slippage
+        this.commissionRate = options.commissionRate ?? 0.001; // 0.1% per trade
+        this.slippage = options.slippage ?? 0.0005; // 0.05% slippage
         this.alphaVantageKey = process.env.ALPHA_VANTAGE_API_KEY;
         this.coingeckoKey = process.env.COINGECKO_API_KEY;
     }
@@ -717,96 +717,50 @@ class BacktestEngine {
     }
 
     simulateTrades(data, signals, initialCapital) {
+        if (!Number.isFinite(initialCapital) || initialCapital <= 0) throw new Error('Invalid initial capital');
+        if (![this.commissionRate, this.slippage].every(x => Number.isFinite(x) && x >= 0 && x < 1)) throw new Error('Invalid execution costs');
         let cash = initialCapital;
-        let shares = 0;
         let position = null;
-        const trades = [];
-        const equityCurve = [];
-
+        const trades = [], equityCurve = [];
+        const closePosition = (price, date, reason) => {
+            const executionPrice = price * (1 - this.slippage);
+            const proceeds = position.shares * executionPrice * (1 - this.commissionRate);
+            const profit = proceeds - position.costBasis;
+            cash += proceeds;
+            trades.push({ date, type: 'sell', price: executionPrice, shares: position.shares,
+                value: proceeds, signal: reason, profit, profitPercent: profit / position.costBasis * 100,
+                portfolioValue: cash });
+            position = null;
+        };
         for (let i = 0; i < data.length; i++) {
-            const price = data[i].close;
-            const signal = signals[i];
-            const portfolioValue = cash + shares * price;
-
-            equityCurve.push({
-                date: data[i].date,
-                value: portfolioValue,
-                benchmark: (data[i].close / data[0].close) * initialCapital
-            });
-
-            if (signal.signal === 'buy' && shares === 0) {
-                const executionPrice = price * (1 + this.slippage);
-                const maxShares = Math.floor(cash / executionPrice);
-                const commission = maxShares * executionPrice * this.commissionRate;
-                shares = Math.floor((cash - commission) / executionPrice);
-                const value = shares * executionPrice + commission;
-                cash -= value;
-
-                position = {
-                    entryDate: data[i].date,
-                    entryPrice: executionPrice,
-                    shares,
-                    signal: signal.reason
-                };
-
-                trades.push({
-                    date: data[i].date,
-                    type: 'buy',
-                    price: executionPrice,
-                    shares,
-                    value,
-                    signal: signal.reason,
-                    portfolioValue
-                });
-            } else if (signal.signal === 'sell' && shares > 0 && position) {
-                const executionPrice = price * (1 - this.slippage);
-                const value = shares * executionPrice;
-                const commission = value * this.commissionRate;
-                cash += value - commission;
-
-                const profit = (executionPrice - position.entryPrice) * shares - commission;
-                const profitPercent = ((executionPrice / position.entryPrice) - 1) * 100;
-
-                trades.push({
-                    date: data[i].date,
-                    type: 'sell',
-                    price: executionPrice,
-                    shares,
-                    value: value - commission,
-                    signal: signal.reason,
-                    profit,
-                    profitPercent,
-                    portfolioValue: cash
-                });
-
-                shares = 0;
-                position = null;
+            const bar = data[i];
+            if (!Number.isFinite(bar.close) || bar.close <= 0) throw new Error('Invalid historical close');
+            // A signal from a completed bar can execute only at the NEXT open.
+            const signal = i > 0 ? signals[i - 1] : null;
+            if (signal?.signal === 'buy' && !position) {
+                if (!Number.isFinite(bar.open) || bar.open <= 0) throw new Error('Historical open required for execution');
+                const executionPrice = bar.open * (1 + this.slippage);
+                const shares = Math.floor(cash / (executionPrice * (1 + this.commissionRate)));
+                if (shares > 0) {
+                    const costBasis = shares * executionPrice * (1 + this.commissionRate);
+                    cash -= costBasis;
+                    position = { shares, costBasis, entryPrice: executionPrice };
+                    trades.push({ date: bar.date, type: 'buy', price: executionPrice, shares,
+                        value: costBasis, signal: signal.reason, portfolioValue: cash + shares * bar.close });
+                }
+            } else if (signal?.signal === 'sell' && position) {
+                if (!Number.isFinite(bar.open) || bar.open <= 0) throw new Error('Historical open required for execution');
+                closePosition(bar.open, bar.date, signal.reason);
             }
+            equityCurve.push({ date: bar.date, value: cash + (position ? position.shares * bar.close : 0),
+                benchmark: bar.close / data[0].close * initialCapital });
         }
-
-        // Close any open position at end
-        if (shares > 0) {
-            const finalPrice = data[data.length - 1].close * (1 - this.slippage);
-            const value = shares * finalPrice;
-            const commission = value * this.commissionRate;
-            cash += value - commission;
-
-            if (position) {
-                const profit = (finalPrice - position.entryPrice) * shares - commission;
-                trades.push({
-                    date: data[data.length - 1].date,
-                    type: 'sell',
-                    price: finalPrice,
-                    shares,
-                    value: value - commission,
-                    signal: 'End of backtest',
-                    profit,
-                    profitPercent: ((finalPrice / position.entryPrice) - 1) * 100,
-                    portfolioValue: cash
-                });
-            }
+        // Explicit terminal liquidation, including both sides' costs in net P&L.
+        if (position) {
+            const last = data[data.length - 1];
+            closePosition(last.close, last.date, 'End of backtest liquidation');
+            equityCurve[equityCurve.length - 1].value = cash;
         }
-
         return { trades, equityCurve, finalValue: cash };
     }
 

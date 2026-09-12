@@ -4,7 +4,14 @@ const mongoose = require('mongoose');
 const crypto = require('crypto');
 
 // Encryption key from environment (should be 32 bytes for AES-256)
-const ENCRYPTION_KEY = process.env.BROKERAGE_ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
+const ENCRYPTION_KEY = process.env.BROKERAGE_ENCRYPTION_KEY;
+function encryptionKey() {
+    if (!/^[a-fA-F0-9]{64}$/.test(ENCRYPTION_KEY || '')) {
+        throw new Error('BROKERAGE_ENCRYPTION_KEY must be a persistent 32-byte hex key');
+    }
+    return Buffer.from(ENCRYPTION_KEY, 'hex');
+}
+if (process.env.NODE_ENV === 'production') encryptionKey();
 const IV_LENGTH = 16;
 
 /**
@@ -13,7 +20,7 @@ const IV_LENGTH = 16;
 function encrypt(text) {
     if (!text) return null;
     const iv = crypto.randomBytes(IV_LENGTH);
-    const key = Buffer.from(ENCRYPTION_KEY, 'hex');
+    const key = encryptionKey();
     const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
     let encrypted = cipher.update(text, 'utf8', 'hex');
     encrypted += cipher.final('hex');
@@ -28,7 +35,7 @@ function decrypt(text) {
     const parts = text.split(':');
     const iv = Buffer.from(parts.shift(), 'hex');
     const encryptedText = parts.join(':');
-    const key = Buffer.from(ENCRYPTION_KEY, 'hex');
+    const key = encryptionKey();
     const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
     let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
     decrypted += decipher.final('utf8');
