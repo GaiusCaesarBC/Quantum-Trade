@@ -1,3 +1,4 @@
+const { scoreSignal } = require('../utils/signalPresentation');
 // services/telegramBot.js — Nexus Signal AI Telegram Bot
 // Synced with /signals page. Same data, same sorting, same quality gate.
 
@@ -48,7 +49,7 @@ async function getQualifiedSignals(limit = 20) {
             const now = new Date();
             const signals = await Prediction.find({
                 confidence: { $gte: MIN_CONFIDENCE },
-                $or: [{ status: 'pending' }, { user: null, isPublic: true }],
+                status: 'pending', user: null, isPublic: true,
                 expiresAt: { $gt: now }
             }).sort({ confidence: -1 }).limit(limit).lean();
 
@@ -59,7 +60,7 @@ async function getQualifiedSignals(limit = 20) {
                 return {
                     id: s._id, symbol: sym, direction: long ? 'LONG' : 'SHORT', long,
                     confidence: conf, tier: conf >= 70 ? 'Strong Setup' : 'Moderate Setup',
-                    score: conf >= 70 ? 7 : 5, createdAt: s.createdAt
+                    ...scoreSignal(s), createdAt: s.createdAt
                 };
             }).sort((a, b) => b.score - a.score);
         } catch (dbErr) {

@@ -1,3 +1,5 @@
+const requireAdmin = require('../middleware/adminMiddleware');
+const { verifyAccessToken } = require('../utils/authTokens');
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
@@ -21,14 +23,14 @@ const sanitizeQueryString = (value) => {
 
 // ============ OPTIONAL AUTH MIDDLEWARE ============
 const optionalAuth = (req, res, next) => {
-    const token = req.cookies.token || req.header('x-auth-token');
+    const token = req.cookies?.token || req.header('x-auth-token');
     
     if (!token) {
         return next();
     }
 
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const decoded = verifyAccessToken(token);
         req.user = decoded.user;
         next();
     } catch (err) {
@@ -1594,7 +1596,7 @@ router.get('/copy/top-traders', async (req, res) => {
 // ============ ADMIN ENDPOINTS ============
 
 // Migration: Set display names and public profiles
-router.post('/admin/migrate-profiles', async (req, res) => {
+router.post('/admin/migrate-profiles', auth, requireAdmin, async (req, res) => {
     try {
         const users = await User.find({});
         let updated = 0;
@@ -1637,7 +1639,7 @@ router.post('/admin/migrate-profiles', async (req, res) => {
 });
 
 // Migration: Initialize gamification for all users
-router.post('/admin/migrate-gamification', async (req, res) => {
+router.post('/admin/migrate-gamification', auth, requireAdmin, async (req, res) => {
     try {
         const users = await User.find({});
         let updated = 0;
@@ -1684,7 +1686,7 @@ router.post('/admin/migrate-gamification', async (req, res) => {
 });
 
 // Migration: Initialize vault for all users
-router.post('/admin/migrate-vault', async (req, res) => {
+router.post('/admin/migrate-vault', auth, requireAdmin, async (req, res) => {
     try {
         const users = await User.find({});
         let updated = 0;
@@ -1724,7 +1726,7 @@ router.post('/admin/migrate-vault', async (req, res) => {
 });
 
 // Update all user stats
-router.post('/admin/update-stats', async (req, res) => {
+router.post('/admin/update-stats', auth, requireAdmin, async (req, res) => {
     try {
         await updateAllUserStats();
         res.json({ 
@@ -1738,7 +1740,7 @@ router.post('/admin/update-stats', async (req, res) => {
 });
 
 // Update single user's stats
-router.post('/admin/update-stats/:userId', async (req, res) => {
+router.post('/admin/update-stats/:userId', auth, requireAdmin, async (req, res) => {
     try {
         await updateUserStats(req.params.userId);
         res.json({ 
@@ -1752,7 +1754,7 @@ router.post('/admin/update-stats/:userId', async (req, res) => {
 });
 
 // 🔥 DEBUG: Check where achievements are stored for a user
-router.get('/debug/achievements/:username', async (req, res) => {
+router.get('/debug/achievements/:username', auth, requireAdmin, async (req, res) => {
     try {
         // Sanitize username for MongoDB query (NoSQL injection prevention)
         const sanitizedUsername = sanitizeQueryString(req.params.username);

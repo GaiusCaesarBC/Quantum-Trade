@@ -1,3 +1,4 @@
+const requireAdmin = require('../middleware/adminMiddleware');
 // Discord Integration Routes
 const express = require('express');
 const router = express.Router();
@@ -230,7 +231,7 @@ router.get('/servers', auth, async (req, res) => {
 });
 
 // Test signal post to Discord (admin/dev only)
-router.post('/test-signal', auth, async (req, res) => {
+router.post('/test-signal', auth, requireAdmin, async (req, res) => {
     try {
         const { postNewSignalToDiscord, isBotActive } = discordService;
 
@@ -260,7 +261,7 @@ router.post('/test-signal', auth, async (req, res) => {
 });
 
 // Test result post to Discord
-router.post('/test-result', auth, async (req, res) => {
+router.post('/test-result', auth, requireAdmin, async (req, res) => {
     try {
         const { postSignalResultToDiscord, isBotActive } = discordService;
 

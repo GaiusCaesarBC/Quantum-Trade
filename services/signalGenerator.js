@@ -78,21 +78,6 @@ async function getMLPrediction(symbol, type, days) {
     return null;
 }
 
-function generateIndicators(price, dir) {
-    const up = dir === 'UP';
-    const rsi = up ? 55 + Math.random() * 15 : 30 + Math.random() * 15;
-    const macd = up ? (Math.random() * 2 + 0.3) : -(Math.random() * 2 + 0.3);
-    return {
-        'RSI': { value: +rsi.toFixed(1), signal: rsi < 40 ? 'BUY' : rsi > 60 ? 'SELL' : 'NEUTRAL' },
-        'MACD': { value: +macd.toFixed(2), signal: macd > 0 ? 'BUY' : 'SELL' },
-        'SMA 20': { value: +(price * (up ? 0.98 : 1.02)).toFixed(2), signal: up ? 'BUY' : 'SELL' },
-        'SMA 50': { value: +(price * (up ? 0.95 : 1.05)).toFixed(2), signal: up ? 'BUY' : 'SELL' },
-        'Bollinger': { value: up ? 'Near Upper Band' : 'Near Lower Band', signal: up ? 'BUY' : 'SELL' },
-        'Volume': { value: ['High', 'Above Average', 'Average'][Math.floor(Math.random() * 3)], signal: 'NEUTRAL' },
-        'Trend': { value: up ? 'Bullish' : 'Bearish', signal: up ? 'BUY' : 'SELL' }
-    };
-}
-
 // ─── Process single asset ─────────────────────────────────
 
 async function processAsset(symbol, assetType, prefetchedPrice = null) {
@@ -137,7 +122,7 @@ async function processAsset(symbol, assetType, prefetchedPrice = null) {
         let direction, targetPrice, confidence, indicators, analysis;
 
         const ml = await getMLPrediction(symbol, assetType, days);
-        if (ml?.prediction) {
+        if (ml?.prediction && ml.prediction_method !== 'rule_based') {
             const p = ml.prediction;
             const mlConf = p.confidence || 0;
             const pctChange = p.price_change_percent || 0;
@@ -171,7 +156,8 @@ async function processAsset(symbol, assetType, prefetchedPrice = null) {
                 return { status: 'skipped', reason: `low magnitude (${pctChange.toFixed(1)}%)` };
             }
 
-            indicators = ml.indicators || ml.technical_analysis || generateIndicators(price, direction);
+            indicators = ml.indicators || {};
+            if (!Object.keys(indicators).length) return { status: 'skipped', reason: 'missing measured indicators' };
             analysis = ml.analysis || {};
         } else {
             // ML unavailable — skip this asset instead of publishing random signals

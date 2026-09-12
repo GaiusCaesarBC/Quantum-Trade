@@ -1,7 +1,11 @@
+const { scoreSignal, signalViewer } = require('../utils/signalPresentation');
+const requireAdmin = require('../middleware/adminMiddleware');
+const { verifyAccessToken } = require('../utils/authTokens');
 // server/routes/predictionsRoutes.js - WITH SHARED PREDICTIONS & ACCURATE PRICING
 
 const express = require('express');
 const router = express.Router();
+router.use(['/recent', '/signals', '/performance'], signalViewer);
 const axios = require('axios');
 const rateLimit = require('express-rate-limit');
 const auth = require('../middleware/authMiddleware');
@@ -586,7 +590,7 @@ function calculateLiveConfidence(prediction, currentPrice) {
 // @route   GET /api/predictions/active/:symbol
 // @desc    Get active shared prediction for a symbol (if exists)
 // @access  Public
-router.get('/active/:symbol', predictionLimiter, async (req, res) => {
+router.get('/active/:symbol', predictionLimiter, auth, requireSubscription('starter'), async (req, res) => {
     try {
         // Validate symbol to prevent SSRF/injection attacks
         let symbol;
@@ -602,6 +606,7 @@ router.get('/active/:symbol', predictionLimiter, async (req, res) => {
         
         // Find an active (non-expired) prediction for this symbol
         const activePrediction = await Prediction.findOne({
+            user: null, isPublic: true,
             symbol: symbol,
             status: 'pending',
             expiresAt: { $gt: new Date() }
@@ -1140,9 +1145,9 @@ router.post('/predict', predictionLimiter, auth, requireSubscription('starter'),
 // @route   GET /api/predictions/live/:id
 // @desc    Get live prediction update with current confidence
 // @access  Private
-router.get('/live/:id', predictionLimiter, auth, async (req, res) => {
+router.get('/live/:id', predictionLimiter, auth, requireSubscription('starter'), async (req, res) => {
     try {
-        const prediction = await Prediction.findById(req.params.id);
+        const prediction = await Prediction.findOne({ _id: req.params.id, $or: [{ user: req.user.id }, { user: null, isPublic: true }] });
         
         if (!prediction) {
             return res.status(404).json({ error: 'Prediction not found' });
@@ -1164,7 +1169,7 @@ router.get('/live/:id', predictionLimiter, auth, async (req, res) => {
         const timeRemaining = Math.max(0, prediction.expiresAt - now);
         const hasExpired = timeRemaining === 0;
 
-        if (hasExpired && prediction.status === 'pending') {
+        if (hasExpired && prediction.status === 'pending' && prediction.user) {
             await prediction.calculateOutcome(currentPrice);
             // Update copied prediction outcomes
             try {
@@ -1199,16 +1204,17 @@ router.get('/live/:id', predictionLimiter, auth, async (req, res) => {
 // @route   GET /api/predictions/shared
 // @desc    Get all active shared predictions
 // @access  Public
-router.get('/shared', predictionLimiter, async (req, res) => {
+router.get('/shared', predictionLimiter, auth, requireSubscription('starter'), async (req, res) => {
     try {
         const { limit = 20 } = req.query;
         
         const activePredictions = await Prediction.find({
+            user: null, isPublic: true,
             status: 'pending',
             expiresAt: { $gt: new Date() }
         })
         .sort({ viewCount: -1, createdAt: -1 }) // Most popular first
-        .limit(parseInt(limit))
+        .limit(Math.max(1, Math.min(200, parseInt(limit, 10) || 20)))
         .populate('user', 'username avatar');
         
         // Get fresh prices for all
@@ -1308,7 +1314,7 @@ router.get('/history', predictionLimiter, auth, async (req, res) => {
 
         const predictions = await Prediction.find(query)
             .sort({ createdAt: -1 })
-            .limit(parseInt(limit));
+            .limit(Math.max(1, Math.min(200, parseInt(limit, 10) || 20)));
 
         res.json({ success: true, predictions });
     } catch (error) {
@@ -1320,14 +1326,14 @@ router.get('/history', predictionLimiter, auth, async (req, res) => {
 // @route   GET /api/predictions/recent-public
 // @desc    Get recent predictions for landing page (no auth required)
 // @access  Public
-router.get('/recent-public', predictionLimiter, async (req, res) => {
+router.get('/recent-public', predictionLimiter, auth, requireSubscription('starter'), async (req, res) => {
     try {
         const { limit = 5 } = req.query;
         
         // Get recent predictions (hide user info for privacy)
-        const predictions = await Prediction.find({ status: 'pending' })
+        const predictions = await Prediction.find({ status: 'pending', user: null, isPublic: true })
             .sort({ createdAt: -1 })
-            .limit(parseInt(limit))
+            .limit(Math.max(1, Math.min(200, parseInt(limit, 10) || 20)))
             .select('symbol direction targetPrice confidence createdAt expiresAt')
             .lean();
         
@@ -1353,7 +1359,7 @@ router.get('/recent', predictionLimiter, async (req, res) => {
             const token = req.header('Authorization')?.replace('Bearer ', '') || req.header('x-auth-token');
             if (token) {
                 const jwt = require('jsonwebtoken');
-                const decoded = jwt.verify(token, process.env.JWT_SECRET);
+                const decoded = verifyAccessToken(token);
                 userId = decoded.user?.id || decoded.id;
             }
         } catch (e) { /* No valid token */ }
@@ -1366,7 +1372,7 @@ router.get('/recent', predictionLimiter, async (req, res) => {
         // User predictions stay on the AI Predict page, not the feed
         predictions = await Prediction.find(systemQuery)
             .sort({ createdAt: -1 })
-            .limit(parseInt(limit))
+            .limit(Math.max(1, Math.min(200, parseInt(limit, 10) || 20)))
             .select(fields)
             .lean();
 
@@ -1630,12 +1636,12 @@ router.get('/stats/me', predictionLimiter, auth, async (req, res) => {
 });
 
 // Public: get any user's predictions by userId
-router.get('/user/:userId', predictionLimiter, async (req, res) => {
+router.get('/user/:userId', predictionLimiter, auth, async (req, res) => {
     try {
         const { limit = 20 } = req.query;
-        const predictions = await Prediction.find({ user: req.params.userId })
+        const predictions = await Prediction.find({ user: req.params.userId, ...(String(req.user.id) === req.params.userId ? {} : { isPublic: true }) })
             .sort({ createdAt: -1 })
-            .limit(parseInt(limit))
+            .limit(Math.max(1, Math.min(200, parseInt(limit, 10) || 20)))
             .select('symbol direction targetPrice currentPrice entryPrice stopLoss takeProfit1 takeProfit2 takeProfit3 confidence status result resultText resultPrice resultAt assetType timeframe createdAt expiresAt signalStrength')
             .lean();
         res.json(predictions);
@@ -1650,7 +1656,7 @@ router.get('/user', predictionLimiter, auth, async (req, res) => {
         
         const predictions = await Prediction.find({ user: req.user.id })
             .sort({ createdAt: -1 })
-            .limit(parseInt(limit));
+            .limit(Math.max(1, Math.min(200, parseInt(limit, 10) || 20)));
         
         const stats = await Prediction.getUserAccuracy(req.user.id);
         
@@ -1696,10 +1702,10 @@ router.get('/platform-stats', async (req, res) => {
     }
 });
 
-router.get('/trending', async (req, res) => {
+router.get('/trending', auth, requireSubscription('starter'), async (req, res) => {
     try {
         const { limit = 10 } = req.query;
-        const trending = await Prediction.getTrending(parseInt(limit));
+        const trending = await Prediction.getTrending(Math.max(1, Math.min(200, parseInt(limit, 10) || 20)));
         res.json(trending);
     } catch (error) {
         console.error('[Predictions] Error:', error.message);
@@ -1769,50 +1775,8 @@ router.get('/price/:symbol', predictionLimiter, auth, async (req, res) => {
 // @route   POST /api/predictions/cleanup
 // @desc    Run cleanup to remove stale/invalid predictions
 // @access  Private (admin only in production)
-router.post('/cleanup', predictionLimiter, auth, async (req, res) => {
-    try {
-        console.log('[Cleanup] Manual cleanup triggered by user:', req.user.id);
-        
-        const now = new Date();
-        const oneDayAgo = new Date(now - 24 * 60 * 60 * 1000);
-        
-        // 1. Delete stale pending predictions (expired + older than 24 hours + no outcome)
-        const staleResult = await Prediction.deleteMany({
-            status: 'pending',
-            expiresAt: { $lt: now },
-            'outcome.actualPrice': { $exists: false },
-            createdAt: { $lt: oneDayAgo }
-        });
-        
-        // 2. Mark old completed predictions for future deletion (optional)
-        const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
-        const markResult = await Prediction.updateMany(
-            {
-                status: { $in: ['correct', 'incorrect', 'expired'] },
-                expiresAt: { $lt: thirtyDaysAgo },
-                deleteAfter: null
-            },
-            {
-                $set: { deleteAfter: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000) } // Delete in 7 days
-            }
-        );
-        
-        // 3. Clear price cache
-        try {
-            priceService.clearCache();
-        } catch (e) { /* ignore */ }
-        
-        res.json({
-            success: true,
-            message: 'Cleanup completed',
-            staleDeleted: staleResult.deletedCount,
-            markedForDeletion: markResult.modifiedCount,
-            cacheCleared: true
-        });
-    } catch (error) {
-        console.error('[Cleanup] Error:', error.message);
-        res.status(500).json({ error: 'Cleanup failed' });
-    }
+router.post('/cleanup', predictionLimiter, auth, requireAdmin, async (req, res) => {
+    return res.status(410).json({ error: 'Historical cleanup is disabled. Use a reviewed offline migration.' });
 });
 
 // @route   GET /api/predictions/cleanup/stats
@@ -2042,16 +2006,17 @@ router.get('/signals', predictionLimiter, async (req, res) => {
 
         const query = {
             confidence: { $gte: MIN_CONF },
-            $or: [{ status: 'pending' }, { user: null, isPublic: true }]
+            user: null, isPublic: true
         };
 
         if (status === 'active') {
+            query.status = 'pending';
             query.expiresAt = { $gt: now };
         }
 
         const signals = await Prediction.find(query)
             .sort({ confidence: -1 })
-            .limit(parseInt(limit) * 2) // Fetch extra for scoring
+            .limit(Math.max(1, Math.min(200, parseInt(limit, 10) || 20)) * 2) // Fetch extra for scoring
             .select('symbol direction confidence currentPrice targetPrice entryPrice stopLoss takeProfit1 takeProfit2 takeProfit3 livePrice livePriceUpdatedAt result resultText resultPrice resultAt assetType signalStrength indicators analysis createdAt expiresAt status priceChangePercent')
             .lean();
 
@@ -2074,14 +2039,10 @@ router.get('/signals', predictionLimiter, async (req, res) => {
 
             const rrNum = range > 0 && Math.abs(entry - sl) > 0 ? Math.abs(target - entry) / Math.abs(entry - sl) : 2;
 
-            const confWeight = (conf / 100) * 4;
-            const rrWeight = Math.min(rrNum / 3, 1) * 2.5;
-            const momentumWeight = conf >= 70 ? 2 : 1;
-            const volumeWeight = conf >= 75 ? 1.5 : 0.75;
-            const score = +(Math.min(10, confWeight + rrWeight + momentumWeight + volumeWeight)).toFixed(1);
+            const { score, riskReward, scoreVersion } = scoreSignal(s);
 
             const tier = conf >= 70 ? 'Strong Setup' : conf >= 65 ? 'Moderate Setup' : 'Below Threshold';
-            const riskReward = +rrNum.toFixed(1);
+
 
             return {
                 id: s._id,
@@ -2091,6 +2052,7 @@ router.get('/signals', predictionLimiter, async (req, res) => {
                 confidence: conf,
                 tier,
                 score,
+                scoreVersion,
                 riskReward,
                 assetType: s.assetType || 'crypto',
                 signalStrength: s.signalStrength || 'moderate',
@@ -2119,7 +2081,7 @@ router.get('/signals', predictionLimiter, async (req, res) => {
 
         // Sort by score descending
         scored.sort((a, b) => b.score - a.score);
-        const topSignals = scored.slice(0, parseInt(limit));
+        const topSignals = scored.slice(0, Math.max(1, Math.min(200, parseInt(limit, 10) || 20)));
 
         // Mark best signal
         if (topSignals.length > 0) {
@@ -2132,7 +2094,7 @@ router.get('/signals', predictionLimiter, async (req, res) => {
             signals: topSignals,
             meta: {
                 minConfidence: MIN_CONF,
-                scoring: 'Confidence 40% + R:R 25% + Momentum 20% + Volume 15%',
+                scoring: 'Confidence 60% + Risk/Reward 40% (v1)',
                 updatedAt: new Date().toISOString()
             }
         });

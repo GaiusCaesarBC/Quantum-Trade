@@ -1,3 +1,4 @@
+const { verifyAccessToken } = require('../utils/authTokens');
 // server/routes/postRoutes.js - Social Posts/Feed Routes
 
 const express = require('express');
@@ -56,7 +57,7 @@ router.get('/', postLimiter, async (req, res) => {
             const token = req.header('Authorization')?.replace('Bearer ', '') || req.header('x-auth-token');
             if (token) {
                 const jwt = require('jsonwebtoken');
-                const decoded = jwt.verify(token, process.env.JWT_SECRET);
+                const decoded = verifyAccessToken(token);
                 userId = decoded.user?.id || decoded.id;
             }
         } catch (e) { /* No valid token, that's fine */ }
