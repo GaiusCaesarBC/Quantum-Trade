@@ -5,9 +5,19 @@ const { verifyAccessToken } = require('../utils/authTokens');
 
 const express = require('express');
 const router = express.Router();
-router.use(['/recent', '/signals', '/performance'], signalViewer);
+
 const axios = require('axios');
 const rateLimit = require('express-rate-limit');
+// Protect all mounts, including /predictions, before viewer/auth database lookups.
+const predictionReadLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 100,
+    message: { error: 'Too many prediction requests, please slow down' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+router.use(predictionReadLimiter);
+router.use(['/recent', '/signals', '/performance'], signalViewer);
 const auth = require('../middleware/authMiddleware');
 const { checkUsageLimit, requireSubscription } = require('../middleware/subscriptionMiddleware');
 const Prediction = require('../models/Prediction');

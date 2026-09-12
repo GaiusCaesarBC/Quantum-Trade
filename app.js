@@ -24,6 +24,14 @@ const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const app = express();
+// These routes are registered before the general API middleware.
+const adminLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    message: { error: 'Too many administrative requests, please slow down' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 const journalRoutes = require('./routes/journalRoutes');
 const screenerRoutes = require('./routes/screenerRoutes');
 const opportunitiesRoutes = require('./routes/opportunitiesRoutes');
@@ -461,7 +469,7 @@ const connectDB = async () => {
         startXPoster();
 
         // X test endpoint (temporary — remove after testing)
-        app.post('/api/test-x-post', auth, requireAdmin, async (req, res) => {
+        app.post('/api/test-x-post', adminLimiter, auth, requireAdmin, async (req, res) => {
             try {
                 const result = await testXPost();
                 res.json({ success: !!result, result: result || 'failed — check Render logs' });
@@ -471,7 +479,7 @@ const connectDB = async () => {
         });
 
         // Signal checker diagnostic endpoint
-        app.get('/api/admin/checker-status', auth, requireAdmin, async (req, res) => {
+        app.get('/api/admin/checker-status', adminLimiter, auth, requireAdmin, async (req, res) => {
             try {
                 const { getCheckerStats, runCheckCycle } = require('./services/signalResultChecker');
                 const Prediction = require('./models/Prediction');
@@ -514,7 +522,7 @@ const connectDB = async () => {
         });
 
         // Manually trigger checker cycle
-        app.post('/api/admin/run-checker', auth, requireAdmin, async (req, res) => {
+        app.post('/api/admin/run-checker', adminLimiter, auth, requireAdmin, async (req, res) => {
             try {
                 const { runCheckCycle, getCheckerStats } = require('./services/signalResultChecker');
                 console.log('[Admin] Manually triggering signal checker...');
@@ -527,17 +535,17 @@ const connectDB = async () => {
         });
 
         // Admin: expire stale predictions that are still "pending" past their expiresAt or older than 14 days
-        app.get('/api/admin/expire-stale', auth, requireAdmin, async (req, res) => {
+        app.get('/api/admin/expire-stale', adminLimiter, auth, requireAdmin, async (req, res) => {
     return res.status(410).json({ error: 'Historical cleanup is disabled. Use a reviewed offline migration.' });
 });
 
         // Admin: clean up bad signals (broken SL/TP levels or blown-past SL)
-        app.get('/api/admin/cleanup-bad-signals', auth, requireAdmin, async (req, res) => {
+        app.get('/api/admin/cleanup-bad-signals', adminLimiter, auth, requireAdmin, async (req, res) => {
     return res.status(410).json({ error: 'Historical cleanup is disabled. Use a reviewed offline migration.' });
 });
 
         // Admin: Check subscription status for a user (by email or userId)
-        app.get('/api/admin/subscription-status', auth, requireAdmin, async (req, res) => {
+        app.get('/api/admin/subscription-status', adminLimiter, auth, requireAdmin, async (req, res) => {
             try {
                 const { email, userId } = req.query;
                 if (!email && !userId) {
@@ -602,11 +610,11 @@ const connectDB = async () => {
 
         // Admin: Manually sync subscription from Stripe (fix missed webhooks)
         // Supports both GET (browser-friendly) and POST
-        app.get('/api/admin/sync-subscription', auth, requireAdmin, async (req, res) => {
+        app.get('/api/admin/sync-subscription', adminLimiter, auth, requireAdmin, async (req, res) => {
             const { email, userId } = req.query;
             return handleSyncSubscription(email, userId, res);
         });
-        app.post('/api/admin/sync-subscription', auth, requireAdmin, async (req, res) => {
+        app.post('/api/admin/sync-subscription', adminLimiter, auth, requireAdmin, async (req, res) => {
             const { email, userId } = req.body;
             return handleSyncSubscription(email, userId, res);
         });
@@ -707,7 +715,7 @@ const connectDB = async () => {
         }
 
         // Manual signal generation trigger (for debugging)
-        app.post('/api/trigger-signals', auth, requireAdmin, async (req, res) => {
+        app.post('/api/trigger-signals', adminLimiter, auth, requireAdmin, async (req, res) => {
             try {
                 const { runCycle } = require('./services/signalGenerator');
                 res.json({ success: true, message: 'Signal cycle triggered — check logs' });
